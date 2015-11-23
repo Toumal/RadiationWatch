@@ -1,172 +1,163 @@
-//////////////////////////////////////////////////
-// Radiation-Watch.org
-// URL http://www.radiation-watch.org/
-//////////////////////////////////////////////////
-
 #include "Arduino.h"
 #include "RadiationWatch.h"
 
-int signCount;  //Counter for Radiation Pulse
+int volatile radiationCount = 0;
+int volatile noiseCount = 0;
+bool volatile radiationFlag = false;
+bool volatile noiseFlag = false;
+// Message buffer for output.
+char msg[256];
 
-//Called via Interrupt when a radiation pulse is detected
-void triggerRadiationPulse() {
-  signCount++;
-  tone(8, 800, 1); // Output classic geiger counter tick noise
+void _onRadiationHandler()
+{
+  radiationCount++;
+  radiationFlag = true;
 }
 
-RadiationWatch::RadiationWatch(int signPin, int noisePin, int signIRQ) : _signPin(signPin), _noisePin(noisePin), _signIRQ(signIRQ)
+void _onNoiseHandler()
 {
-  signCount = 0;
+  noiseCount++;
+  noiseFlag = true;
+}
+
+RadiationWatch::RadiationWatch(
+  int signPin, int noisePin, int signIrq, int noiseIrq):
+    _signPin(signPin), _noisePin(noisePin), _signIrq(signIrq),
+    _noiseIrq(noiseIrq)
+{
   _prevTime = 0;
   index = 0;
-  
-  noiseCount = 0;
-  
-  sON = 0;
-  nON = 0;
-  
   _cpm = 0;
   cpmIndex = 0;
   cpmIndexPrev = 0;
-  
+  _duration = 0;
   totalSec = 0;
   totalHour = 0;
-  
   cpmTimeMSec = 0;
   cpmTimeSec = 0;
+  _radiationCallback = NULL;
+  _noiseCallback = NULL;
 }
 
 void RadiationWatch::setup()
 {
-  //PIN setting for Radiation Pulse
-  pinMode(_signPin,INPUT);
-  digitalWrite(_signPin,HIGH);
-
-  //PIN setting for Noise Pulse
-  pinMode(_noisePin,INPUT);
-  digitalWrite(_noisePin,HIGH);
-  
-  //Attach interrupt handler to catch incoming radiation pulses, 
-  //and execute triggerRadiationPulse() when this happens.
-  attachInterrupt(_signIRQ, triggerRadiationPulse, FALLING);
-
-  //Initialize cpmHistory[]
-  for(int i = 0; i < kHistoryCount;i++ )
-  {
+  pinMode(_signPin, INPUT);
+  digitalWrite(_signPin, HIGH);
+  pinMode(_noisePin, INPUT);
+  digitalWrite(_noisePin, HIGH);
+  // Initialize cpmHistory[].
+  for(int i = 0; i < kHistoryCount; i++)
     _cpmHistory[i] = 0;
-  }
-  
+  // Init time.
   _prevTime = millis();
+  // Attach interrupt handlers.
+  attachInterrupt(_signIrq, _onRadiationHandler, RISING);
+  attachInterrupt(_noiseIrq, _onNoiseHandler, RISING);
 }
 
-int RadiationWatch::signPin()
+void RadiationWatch::registerRadiationCallback(void (*callback)(void))
 {
-  return digitalRead(_signPin);
+  _radiationCallback = callback;
 }
 
-int RadiationWatch::noisePin()
+void RadiationWatch::registerNoiseCallback(void (*callback)(void))
 {
-  return digitalRead(_noisePin);
+  _noiseCallback = callback;
 }
 
 void RadiationWatch::loop()
 {
-  // Raw data of Radiation Pulse: Not-detected -> High, Detected -> Low
-  int sign = signPin();
-  // Raw data of Noise Pulse: Not-detected -> Low, Detected -> High
-  int noise = noisePin();
-
-  //Noise Pulse normally keeps high for about 100[usec]
-  if(noise==1 && nON==0)
-  {//Deactivate Noise Pulse counting for a while
-    nON = 1;
-    noiseCount++;
-  }else if(noise==0 && nON==1){
-    nON = 0;
-  }
-
-  //Output readings to serial port, after 10000 loops
-  if(index==10000) //About 160-170 msec in Arduino Nano(ATmega328)
-  {
-    //Get current time
-    int currTime = millis();
-
-    //No noise detected in 10000 loops
-    if(noiseCount == 0)
-    {
-      //Shift an array for counting log for each 6 sec.
-      if( totalSec % 6 == 0 && cpmIndexPrev != totalSec)
-      {
+  // Process radiation dose.
+  // About 160-170 msec in Arduino Nano(ATmega328).
+  // TODO: do not use an index but measure time ellasped to determine when
+  // to process the statistics.
+  // TODO Update on radiation pulse, but not too fast (let a lag) so we does not
+  // count radiation pulse when there are also noise. (use radiationFlag)
+  if(index > 10000) {
+    int currentTime = millis();
+    // No noise detected in 10000 loops.
+    if(noiseCount == 0) {
+      // Shift an array for counting log for each 6 sec.
+      if(totalSec % 6 == 0 && cpmIndexPrev != totalSec) {
         cpmIndexPrev = totalSec;
         cpmIndex++;
-        
         if(cpmIndex >= kHistoryCount)
-        {
           cpmIndex = 0;
-        }
-        
         if(_cpmHistory[cpmIndex] > 0)
-        {
           _cpm -= _cpmHistory[cpmIndex];
-        }
         _cpmHistory[cpmIndex] = 0;
       }
-      
-      //Store count log
-      _cpmHistory[cpmIndex] += signCount;
-      //Add number of counts
-      _cpm += signCount;
-      
-      //Get ready time for 10000 loops
-      cpmTimeMSec += abs(currTime - _prevTime);
-      //Transform from msec. to sec. (to prevent overflow)
-      if(cpmTimeMSec >= 1000)
-      {
+      noInterrupts();
+      // Store count log.
+      _cpmHistory[cpmIndex] += radiationCount;
+      // Add number of counts.
+      _cpm += radiationCount;
+      // Get ready time for 10000 loops.
+      cpmTimeMSec += abs(currentTime - _prevTime);
+      // Transform from msec. to sec. (to prevent overflow).
+      if(cpmTimeMSec >= 1000) {
         cpmTimeMSec -= 1000;
-        //Add measurement time to calcurate cpm readings (max=20min.)
-        if( cpmTimeSec >= 20*60 )
-        {
+        // Add measurement time to calcurate cpm readings (max=20min.)
+        if(cpmTimeSec >= 20*60)
           cpmTimeSec = 20*60;
-        }else{
+        else
           cpmTimeSec++;
-        }
-        
-        //Total measurement time
+        // Total measurement time.
         totalSec++;
-        //Transform from sec. to hour. (to prevent overflow)
+        //Transform from sec. to hour. (to prevent overflow).
         const int kSecondsInHour = 60 * 60;
-        if(totalSec >= kSecondsInHour)
-        {
+        if(totalSec >= kSecondsInHour) {
           totalSec -= kSecondsInHour;
           totalHour++;
         }
       }
-      
-      printStatus();
-      
-      index=0;
+      index = 0;
     }
-    
-    //Initialization for next 10000 loops
-    _prevTime = currTime;
-    signCount = 0;
+    // Initialization for next 10000 loops.
+    _prevTime = currentTime;
+    radiationCount = 0;
     noiseCount = 0;
+    interrupts();
   }
-  
   index++;
+  // Enable the callbacks.
+  if(_radiationCallback && radiationFlag) {
+    radiationFlag = false;
+    _radiationCallback();
+  }
+  if(_noiseCallback && noiseFlag) {
+    noiseFlag = false;
+    _noiseCallback();
+  }
 }
 
-void RadiationWatch::printKey()
+char* RadiationWatch::csvKeys()
 {
+  // CSV-formatting for output.
+  return "hour[h],sec[s],count,cpm,uSv/h,uSv/hError";
 }
 
-void RadiationWatch::printStatus()
+char* RadiationWatch::csvStatus()
 {
-}
-
-boolean RadiationWatch::isAvailable()
-{
-  return cpmTime() != 0;
+  //String buffers of float values for serial output
+  char cpmBuff[20];
+  char uSvBuff[20];
+  char uSvdBuff[20];
+  // Elapsed time of measurement (max=20min.)
+  double min = cpmTime();
+  dtostrf(cpm(), -1, 3, cpmBuff);
+  dtostrf(uSvh(), -1, 3, uSvBuff);  // uSv/h
+  dtostrf(uSvhError(), -1, 3, uSvdBuff);  // error of uSv/h
+  // Format message.
+  sprintf(msg, "%d,%d.%03d,%d,%s,%s,%s",
+    totalHour,totalSec,
+    cpmTimeMSec,
+    radiationCount,
+    cpmBuff,
+    uSvBuff,
+    uSvdBuff
+    );
+  return msg;
 }
 
 double RadiationWatch::cpmTime()
@@ -177,16 +168,11 @@ double RadiationWatch::cpmTime()
 double RadiationWatch::cpm()
 {
   double min = cpmTime();
-  
-  if (min != 0) {
-    return _cpm / min;
-  }
-  else {
-    return 0;
-  }
+  return (min) ? _cpm / min : 0;
 }
 
-static const double kAlpha = 53.032; // cpm = uSv x alpha
+// cpm = uSv x alpha
+static const double kAlpha = 53.032;
 
 double RadiationWatch::uSvh()
 {
@@ -196,51 +182,5 @@ double RadiationWatch::uSvh()
 double RadiationWatch::uSvhError()
 {
   double min = cpmTime();
-  
-  if (min != 0) {
-    return sqrt(_cpm) / min / kAlpha;
-  }
-  else {
-    return 0;
-  }
+  return (min) ? sqrt(_cpm) / min / kAlpha : 0;
 }
-
-RadiationWatchPrinter::RadiationWatchPrinter(int signPin, int noisePin, int signIRQ) : RadiationWatch(signPin, noisePin, signIRQ)
-{
-}
-
-void RadiationWatchPrinter::printKey()
-{
-  //CSV-formatting for serial output (substitute , for _)
-  Serial.println("hour[h]_sec[s]_count_cpm_uSv/h_uSv/hError");
-}
-
-void RadiationWatchPrinter::printStatus()
-{
-  char msg[256]; //Message buffer for serial output
-  //String buffers of float values for serial output
-  char cpmBuff[20];
-  char uSvBuff[20];
-  char uSvdBuff[20];
-    
-  //Elapsed time of measurement (max=20min.)
-  double min = cpmTime();
-  dtostrf(cpm(), -1, 3, cpmBuff);
-  dtostrf(uSvh(), -1, 3, uSvBuff);  // uSv/h
-  dtostrf(uSvhError(), -1, 3, uSvdBuff);  // error of uSv/h
-    
-  //Create message for serial port
-  sprintf(msg, "%d,%d.%03d,%d,%s,%s,%s",
-    totalHour,totalSec,
-    cpmTimeMSec,
-    signCount,
-    cpmBuff,
-    uSvBuff,
-    uSvdBuff
-    );
-    
-  //Send message to serial port
-  Serial.println(msg);
-}
-
-

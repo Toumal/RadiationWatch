@@ -5,22 +5,28 @@
 
 #include "RadiationWatch.h"
 
-RadiationWatchPrinter radiationWatch(2, 5);
+RadiationWatch radiationWatch(2, 3, 0, 1);
+
+void onRadiationPulse() {
+  Serial.println(radiationWatch.csvStatus());
+}
 
 void setup()
 {
   //Serial setup
   //9600bps
   Serial.begin(9600);
-  
+
   radiationWatch.setup();
 
-  radiationWatch.printKey();
+  // Register the callback.
+  radiationWatch.registerRPCallback(&onRadiationPulse);
+
+  Serial.println(radiationWatch.csvKeys());
+  Serial.println(radiationWatch.csvStatus());
 }
 
 void loop()
 {
   radiationWatch.loop();
 }
-
-
